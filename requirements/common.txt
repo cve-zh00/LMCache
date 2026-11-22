@@ -1,3 +1,5 @@
+aiofile
+aiofiles
 blake3
 aiohttp
 awscrt
@@ -21,7 +23,6 @@ opentelemetry-exporter-otlp >= 1.20.0
 opentelemetry-exporter-prometheus >= 0.50b0, <= 0.61b0
 prometheus_client >= 0.18.0, <= 0.24.1
 psutil
-py-asyncfiles
 py-cpuinfo
 # cupy.testing._random unconditionally imports pytest at module level;
 # torch._dynamo triggers this via inspect.getmodule() during compilation.

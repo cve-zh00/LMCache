@@ -166,7 +166,7 @@ autodoc_mock_imports = [
     "nvtx",
     "redis",
     "lmcache.cuda_ops",
-    "asyncfiles",
+    "aiofiles",
     "zmq",
     "transformers",
     "safetensors",

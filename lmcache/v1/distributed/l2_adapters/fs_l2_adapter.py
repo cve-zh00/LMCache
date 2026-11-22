@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-File-system based L2 adapter using asyncfiles for async I/O.
+File-system based L2 adapter using aiofiles or optional asyncfiles for async I/O.
 
 Stores KV cache objects as raw tensor bytes on disk (no metadata
 header).  Each ObjectKey maps to a separate ``.data`` file whose
@@ -11,11 +11,15 @@ name encodes all key fields so it can be reversed on startup.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Coroutine
+from concurrent.futures import Future
+from contextlib import ExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, TypeVar, Union
 import asyncio
 import ctypes
 import errno
+import importlib
 import os
 import threading
 
@@ -27,8 +31,8 @@ if TYPE_CHECKING:
     from lmcache.v1.memory_management import MemoryObj
 
 # Third Party
-import asyncfiles
-import asyncfiles.os
+import aiofiles
+import aiofiles.os
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -61,6 +65,64 @@ logger = init_logger(__name__)
 # at the transfer itself. Any of these means "use buffered I/O instead",
 # not "this key is lost". (ENOTSUP equals EOPNOTSUPP on Linux.)
 _DIRECT_IO_REFUSED_ERRNOS = frozenset({errno.EINVAL, errno.EOPNOTSUPP})
+_T = TypeVar("_T")
+
+
+class _FSIOWorker:
+    """Own an I/O thread; optional-provider adapters share one reference-counted worker.
+
+    The released asyncfiles libuv backend uses a process-global native loop.
+    All its LMCache callbacks must therefore run on one asyncio thread.
+    """
+
+    _condition = threading.Condition()
+    _asyncfiles_worker: _FSIOWorker | None = None
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self._users = 1  # Guarded by _condition, including during final shutdown.
+        try:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        except BaseException:
+            self.loop.close()
+            raise
+
+    @classmethod
+    def acquire_asyncfiles(cls) -> _FSIOWorker:
+        """Acquire the shared worker, waiting for any retiring worker to exit."""
+        with cls._condition:
+            while cls._asyncfiles_worker is not None:
+                if cls._asyncfiles_worker._users:
+                    cls._asyncfiles_worker._users += 1
+                    return cls._asyncfiles_worker
+                cls._condition.wait()
+            cls._asyncfiles_worker = cls()
+            return cls._asyncfiles_worker
+
+    def release(self) -> bool:
+        """Drop one owner; stop only the final owner's worker, without self-joining."""
+        with self._condition:
+            self._users -= 1
+            if self._users:
+                return False
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        if threading.current_thread() is not self.thread:
+            self.thread.join()
+        return True
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_forever()
+        finally:
+            try:
+                self.loop.close()
+            finally:
+                with self._condition:
+                    if type(self)._asyncfiles_worker is self:
+                        type(self)._asyncfiles_worker = None
+                        self._condition.notify_all()
 
 
 def _device_logical_block_size(path: Path) -> int:
@@ -146,7 +208,7 @@ def _readinto_full(
 
 
 async def _async_readinto_full(
-    f,  # asyncfiles async file handle
+    f,  # selected provider's async file handle
     buf: Union[bytearray, memoryview, bytes],
 ) -> int:
     """Async version of :func:`_readinto_full`."""
@@ -183,6 +245,7 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
     - base_path: directory for storing KV cache files.
     - relative_tmp_dir: optional relative sub-dir for
       temp files (same as fs_connector_relative_tmp_dir).
+    - io_backend: aiofiles (default) or optional asyncfiles.
     """
 
     def __init__(
@@ -191,7 +254,8 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
         relative_tmp_dir: Optional[str] = None,
         read_ahead_size: Optional[int] = None,
         use_odirect: bool = False,
-    ):
+        io_backend: str = "aiofiles",
+    ) -> None:
         """Initialize FSL2AdapterConfig.
 
         Args:
@@ -205,11 +269,22 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
                 using O_DIRECT for both reads and writes.
                 Requires buffer sizes aligned to the
                 filesystem block size.
+            io_backend: Async I/O provider, "aiofiles" (default) or
+                "asyncfiles" (requires pip install py-asyncfiles).
+
+        Raises:
+            ValueError: If io_backend is not a supported provider string.
         """
+        if not isinstance(io_backend, str) or io_backend not in (
+            "aiofiles",
+            "asyncfiles",
+        ):
+            raise ValueError("io_backend must be 'aiofiles' or 'asyncfiles'")
         self.base_path = base_path
         self.relative_tmp_dir = relative_tmp_dir
         self.read_ahead_size = read_ahead_size
         self.use_odirect = use_odirect
+        self.io_backend = io_backend
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSL2AdapterConfig":
@@ -232,6 +307,7 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             relative_tmp_dir=relative_tmp_dir,
             read_ahead_size=read_ahead_size,
             use_odirect=use_odirect,
+            io_backend=d.get("io_backend", "aiofiles"),
         )
 
     @classmethod
@@ -247,26 +323,54 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             "readahead by reading this many bytes first "
             "(optional)\n"
             "- use_odirect (bool): bypass page cache "
-            "via O_DIRECT (optional, default false)"
+            "via O_DIRECT (optional, default false)\n"
+            "- io_backend (str): aiofiles or asyncfiles "
+            "(optional, default aiofiles; asyncfiles requires "
+            "pip install py-asyncfiles)"
         )
 
 
 class FSL2Adapter(L2AdapterInterface):
     """
-    File-system backed L2 adapter with async I/O via *asyncfiles*.
+    File-system backed L2 adapter with per-instance async I/O providers.
+
+    Uses aiofiles by default; asyncfiles is imported only when selected.
 
     Each file stores **only** the raw tensor bytes (no metadata
     header), which gives maximum I/O throughput.  The file name
     itself encodes the full ``ObjectKey`` so it is reversible.
 
-    Thread safety is ensured via a lock for shared bookkeeping
-    and an asyncio event loop running on a dedicated daemon
-    thread.
+    Thread safety is ensured via a lock for shared bookkeeping. aiofiles
+    instances own separate workers; asyncfiles instances share one worker
+    to preserve native callback thread affinity.
     """
 
     _DELETE_CONCURRENCY = 64
 
-    def __init__(self, config: FSL2AdapterConfig):
+    def __init__(self, config: FSL2AdapterConfig) -> None:
+        """Select the I/O provider before allocating background resources.
+
+        Args:
+            config: Filesystem paths, tuning options, and I/O provider.
+
+        Raises:
+            ImportError: If the selected asyncfiles provider cannot be imported.
+        """
+        if config.io_backend == "asyncfiles":
+            try:
+                self._io_lib = importlib.import_module("asyncfiles")
+            except ModuleNotFoundError as exc:
+                if exc.name != "asyncfiles":
+                    raise
+                raise ImportError(
+                    "io_backend='asyncfiles' requires py-asyncfiles; "
+                    "pip install py-asyncfiles"
+                ) from exc
+            self._io_os = importlib.import_module("asyncfiles.os")
+        else:
+            self._io_lib = aiofiles
+            self._io_os = aiofiles.os
+
         super().__init__()
         self._config = config
         base = config.base_path
@@ -302,31 +406,42 @@ class FSL2Adapter(L2AdapterInterface):
                 or os.statvfs(self._base_path).f_bsize
             )
 
-        self._store_efd = create_event_notifier()
-        self._lookup_efd = create_event_notifier()
-        self._load_efd = create_event_notifier()
-
         # Task bookkeeping
         self._next_task_id: L2TaskId = 0
         self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
         self._completed_load_tasks: dict[L2TaskId, Bitmap] = {}
         self._lock = threading.Lock()
+        # Only the owning worker accesses the task set.
+        self._pending_tasks: set[asyncio.Task[object]] = set()
+        self._close_future: Future[bool] | None = None
 
-        # Background asyncio event loop
-        self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
-        self._loop_thread.start()
+        with ExitStack() as cleanup:
+            self._store_efd = create_event_notifier()
+            cleanup.callback(self._store_efd.close)
+            self._lookup_efd = create_event_notifier()
+            cleanup.callback(self._lookup_efd.close)
+            self._load_efd = create_event_notifier()
+            cleanup.callback(self._load_efd.close)
+            self._worker = (
+                _FSIOWorker.acquire_asyncfiles()
+                if config.io_backend == "asyncfiles"
+                else _FSIOWorker()
+            )
+            cleanup.callback(self._worker.release)
+            self._loop = self._worker.loop
+            self._loop_thread = self._worker.thread
 
-        logger.info(
-            "Initialized FSL2Adapter with base_path=%s, "
-            "relative_tmp_dir=%s, "
-            "read_ahead_size=%s, use_odirect=%s",
-            self._base_path,
-            self._relative_tmp_dir,
-            self._read_ahead_size,
-            self._use_odirect,
-        )
+            logger.info(
+                "Initialized FSL2Adapter with base_path=%s, "
+                "relative_tmp_dir=%s, "
+                "read_ahead_size=%s, use_odirect=%s",
+                self._base_path,
+                self._relative_tmp_dir,
+                self._read_ahead_size,
+                self._use_odirect,
+            )
+            cleanup.pop_all()
 
     # ------------------------------------------------------------------
     # Event Fd Interface
@@ -353,10 +468,7 @@ class FSL2Adapter(L2AdapterInterface):
         with self._lock:
             task_id = self._get_next_task_id()
 
-        asyncio.run_coroutine_threadsafe(
-            self._execute_store(keys, objects, task_id),
-            self._loop,
-        )
+        self._submit(self._execute_store(keys, objects, task_id))
         return task_id
 
     def pop_completed_store_tasks(
@@ -384,10 +496,7 @@ class FSL2Adapter(L2AdapterInterface):
         with self._lock:
             task_id = self._get_next_task_id()
 
-        asyncio.run_coroutine_threadsafe(
-            self._execute_lookup(keys, task_id),
-            self._loop,
-        )
+        self._submit(self._execute_lookup(keys, task_id))
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -411,10 +520,7 @@ class FSL2Adapter(L2AdapterInterface):
         with self._lock:
             task_id = self._get_next_task_id()
 
-        asyncio.run_coroutine_threadsafe(
-            self._execute_load(keys, objects, task_id),
-            self._loop,
-        )
+        self._submit(self._execute_load(keys, objects, task_id))
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -427,8 +533,10 @@ class FSL2Adapter(L2AdapterInterface):
 
     def report_status(self) -> dict:
         """Return a status dict for the FS L2 adapter."""
+        with self._lock:
+            healthy = self._close_future is None and self._loop_thread.is_alive()
         return {
-            "is_healthy": self._loop_thread.is_alive(),
+            "is_healthy": healthy,
             "type": "FSL2Adapter",
             "base_path": str(self._base_path),
             "use_odirect": self._use_odirect,
@@ -453,10 +561,7 @@ class FSL2Adapter(L2AdapterInterface):
         if not keys:
             return
         try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._execute_delete(keys),
-                self._loop,
-            )
+            fut = self._submit(self._execute_delete(keys))
             deleted_keys, deleted_sizes = fut.result(timeout=30.0)
         except Exception as e:
             logger.warning("FSL2Adapter delete failed: %s", e)
@@ -483,40 +588,58 @@ class FSL2Adapter(L2AdapterInterface):
         return MemoryTags(MemorySegment.STORAGE, residency)
 
     def close(self) -> None:
-        async def _stop_tasks():
-            tasks = [
-                t
-                for t in asyncio.all_tasks(self._loop)
-                if t is not asyncio.current_task()
-            ]
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+        """Cancel this instance's tasks and release its worker reference.
 
-        if self._loop.is_running():
-            fut = asyncio.run_coroutine_threadsafe(_stop_tasks(), self._loop)
-            try:
-                fut.result(timeout=5)
-            except Exception:
-                pass
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        Calls from the I/O thread schedule cleanup without blocking that thread.
+        Other callers wait for cleanup and, for the last owner, thread shutdown.
 
-        self._loop_thread.join()
-        self._loop.close()
-
-        self._store_efd.close()
-        self._lookup_efd.close()
-        self._load_efd.close()
-        logger.info("FSL2Adapter closed")
+        Raises:
+            TimeoutError: If cancellation does not finish within five seconds.
+        """
+        with self._lock:
+            if self._close_future is None:
+                self._close_future = asyncio.run_coroutine_threadsafe(
+                    self._shutdown(), self._loop
+                )
+            future = self._close_future
+        if threading.current_thread() is self._loop_thread:
+            return
+        if future.result(timeout=5):
+            self._loop_thread.join()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _run_event_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+    def _submit(self, operation: Coroutine[object, object, _T]) -> Future[_T]:
+        with self._lock:
+            if self._close_future is not None:
+                operation.close()
+                raise RuntimeError("FSL2Adapter is closed")
+            return asyncio.run_coroutine_threadsafe(
+                self._run_task(operation), self._loop
+            )
+
+    async def _run_task(self, operation: Coroutine[object, object, _T]) -> _T:
+        task = asyncio.current_task()
+        assert task is not None
+        self._pending_tasks.add(task)
+        try:
+            return await operation
+        finally:
+            self._pending_tasks.remove(task)
+
+    async def _shutdown(self) -> bool:
+        tasks = list(self._pending_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._store_efd.close()
+        self._lookup_efd.close()
+        self._load_efd.close()
+        logger.info("FSL2Adapter closed")
+        return self._worker.release()
 
     def _get_next_task_id(self) -> L2TaskId:
         tid = self._next_task_id
@@ -532,12 +655,12 @@ class FSL2Adapter(L2AdapterInterface):
     ) -> bool:
         """Check whether the file for *key* exists on disk.
 
-        Uses ``asyncfiles.os.path.exists`` so the check is
+        Uses the selected provider's async ``os.path.exists`` so the check is
         non-blocking and always reflects the real FS state,
         which is critical for multi-node shared-FS setups.
         """
         path = self._key_to_path(key)
-        return await asyncfiles.os.path.exists(path)
+        return await self._io_os.path.exists(path)
 
     def _key_to_file_and_tmp_path(self, key: ObjectKey) -> tuple[Path, Path]:
         """Return ``(final_path, tmp_path)``.
@@ -670,7 +793,7 @@ class FSL2Adapter(L2AdapterInterface):
                 file_path, tmp_path = self._key_to_file_and_tmp_path(key)
 
                 # Skip if already stored on disk
-                if await asyncfiles.os.path.exists(file_path):
+                if await self._io_os.path.exists(file_path):
                     continue
                 buf = obj.byte_array
                 size = len(buf)
@@ -684,10 +807,15 @@ class FSL2Adapter(L2AdapterInterface):
                             buf,
                         )
                     else:
-                        async with asyncfiles.open(tmp_path, "wb") as f:
-                            await f.write(buf)
+                        async with self._io_lib.open(tmp_path, "wb") as f:
+                            written = await f.write(buf)
+                            if written != size:
+                                raise OSError(
+                                    errno.EIO,
+                                    f"Incomplete write: expected {size}, got {written}",
+                                )
 
-                    await asyncfiles.os.replace(tmp_path, file_path)
+                    await self._io_os.replace(tmp_path, file_path)
                     bytes_written += size
                     stored_keys.append(key)
                     stored_sizes.append(size)
@@ -701,8 +829,8 @@ class FSL2Adapter(L2AdapterInterface):
                         "FSL2Adapter failed to store %s",
                         file_path,
                     )
-                    if await asyncfiles.os.path.exists(tmp_path):
-                        await asyncfiles.os.unlink(tmp_path)
+                    if await self._io_os.path.exists(tmp_path):
+                        await self._io_os.unlink(tmp_path)
                     success = False
         except Exception:
             logger.exception(
@@ -747,7 +875,7 @@ class FSL2Adapter(L2AdapterInterface):
         for i, key in enumerate(keys):
             file_path = self._key_to_path(key)
             try:
-                dst_buf = objects[i].byte_array
+                dst_buf: Union[bytearray, memoryview, bytes] = objects[i].byte_array
                 expected = len(dst_buf)
                 num_read: Optional[int] = None
 
@@ -778,7 +906,7 @@ class FSL2Adapter(L2AdapterInterface):
                 # Standard async path with optional
                 # read-ahead
                 expected = len(dst_buf)
-                async with asyncfiles.open(file_path, "rb") as f:
+                async with self._io_lib.open(file_path, "rb") as f:
                     if self._read_ahead_size is None:
                         num_read = await _async_readinto_full(f, dst_buf)
                     else:
@@ -838,8 +966,8 @@ class FSL2Adapter(L2AdapterInterface):
             file_path = self._key_to_path(key)
             async with sem:
                 try:
-                    size = (await asyncfiles.os.stat(file_path)).st_size
-                    await asyncfiles.os.unlink(file_path)
+                    size = (await self._io_os.stat(file_path)).st_size
+                    await self._io_os.unlink(file_path)
                 except FileNotFoundError:
                     return None
                 except Exception:

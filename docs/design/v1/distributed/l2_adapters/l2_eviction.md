@@ -228,6 +228,28 @@ capacity) can omit steps 2–6 and rely on the base class no-op defaults.
 
 **Note on `FSL2Adapter`:** `delete()` and the listener events are implemented, so
 the base class tracks `total_bytes_used` from the store / delete notifications.
+Each instance selects `aiofiles` (default) or optional `asyncfiles` through
+`FSL2AdapterConfig.io_backend`. The selected provider handles buffered file I/O,
+existence checks, atomic replacement, and stat/unlink operations, including
+deletion accounting. Optional imports resolve before event notifiers or background
+threads are allocated; only a missing root `asyncfiles` package is translated to
+an installation hint. Provider selection does not change listener, cancellation,
+or best-effort deletion semantics. Direct-I/O transfers and their buffered fallback
+remain synchronous OS operations in an executor with either provider.
+
+The released asyncfiles backend shares a process-global libuv loop, whose callbacks
+complete asyncio futures directly. Its adapters therefore share one reference-counted
+worker thread/event loop, unlike independent aiofiles workers. Each adapter tracks
+and cancels only its own tasks. Last release retires the worker; new acquirers wait
+until its event loop is closed before creating another. Closing from an I/O callback
+schedules cleanup without joining that thread. Constructor failures release acquired
+worker references and event notifiers. This coordinates LMCache's callers only, not
+unrelated host code using asyncfiles on other loops.
+
+Buffered stores check the returned write count before atomic replacement. A short
+write, including zero, takes the existing failure/temporary-file cleanup path and
+does not emit a stored notification or account the full object size.
+
 Two caveats:
 
 1. The adapter declares no max capacity, so `usage_fraction == -1.0` and the
